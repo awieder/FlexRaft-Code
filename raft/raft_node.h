@@ -28,6 +28,7 @@ class RaftNode {
     std::string storage_filename;
     // TODO: Add state machine into this config
     Rsm *rsm;
+    bool use_craft = false;
   };
 
   // Constructor
@@ -93,5 +94,6 @@ class RaftNode {
   std::atomic<bool> disconnected_;
   Rsm *rsm_;
   Storage *storage_;
+  bool use_craft_ = false;
 };
 }  // namespace raft

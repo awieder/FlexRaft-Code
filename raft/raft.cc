@@ -25,6 +25,8 @@ namespace raft {
 RaftState *RaftState::NewRaftState(const RaftConfig &config) {
   auto ret = new RaftState;
   ret->id_ = config.id;
+  ret->use_craft_ = config.use_craft;
+  ret->craft_mode_ = kNormalMode;
 
   Storage::PersistRaftState state;
   // If the storage provides a valid persisted raft state, use this
@@ -73,6 +75,7 @@ RaftState *RaftState::NewRaftState(const RaftConfig &config) {
 
   // Reserve space for recording commit start time
   ret->commit_start_time_.reserve(100000);
+  printf("S%d use_craft=%d\n", ret->id_, ret->use_craft_);
 
   return ret;
 }
@@ -1385,6 +1388,20 @@ bool RaftState::FindFullEntryInStripe(const Stripe *stripe, LogEntry *ent) {
     }
   }
   return false;
+}
+
+void RaftState::SwitchToDegradedMode() {
+    if (craft_mode_ != kDegradedMode) {
+        craft_mode_ = kDegradedMode;
+        MaybeReEncodingAndReplicate();
+    }
+}
+
+void RaftState::SwitchToNormalMode() {
+    if (craft_mode_ != kNormalMode) {
+        craft_mode_ = kNormalMode;
+        MaybeReEncodingAndReplicate();
+    }
 }
 
 }  // namespace raft

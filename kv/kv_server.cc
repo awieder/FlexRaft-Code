@@ -42,6 +42,7 @@ KvServer *KvServer::NewKvServer(const KvClusterConfig &config, raft::raft_node_i
   auto kv_node_config = config.at(node_id);
   auto raft_config = raft::RaftNode::NodeConfig{node_id, raft_cluster_config,
                                                 kv_node_config.raft_log_filename, nullptr};
+  raft_config.use_craft = kv_node_config.use_craft;
   auto kv_server = KvServer::NewKvServer({raft_config, kv_node_config.kv_dbname});
   // Register the RPC clients to it
   for (const auto &[id, conf] : config) {

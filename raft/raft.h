@@ -19,6 +19,11 @@ namespace raft {
 
 class Storage;
 
+enum CRaftMode {
+  kNormalMode = 0,
+  kDegradedMode = 1,
+};
+
 enum RaftRole {
   kFollower = 1,
   kCandidate = 2,
@@ -52,6 +57,8 @@ struct RaftConfig {
   int64_t electionTimeMin, electionTimeMax;
 
   Rsm *rsm;
+  bool use_craft = false; 
+
 };
 
 struct ProposeResult {
@@ -425,6 +432,9 @@ class RaftState {
   int AliveServersOfLastPoint() const { return alive_servers_of_last_point_; }
   void UpdateAliveServers(int num) { alive_servers_of_last_point_ = num; }
 
+  void SwitchToDegradedMode();
+  void SwitchToNormalMode();
+
  public:
   // For concurrency control. A raft state instance might be accessed via
   // multiple threads, e.g. RPC thread that receives request; The state machine
@@ -520,5 +530,8 @@ class RaftState {
   // Some report information about preleader phase
   util::TimePoint preleader_timepoint_;
   uint64_t preleader_recover_ent_cnt_ = 0;
+
+  bool use_craft_ = false;
+  CRaftMode craft_mode_ = kNormalMode;
 };
 }  // namespace raft

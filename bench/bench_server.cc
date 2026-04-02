@@ -14,6 +14,7 @@
 
 DEFINE_string(conf, "", "The position of cluster configuration file");
 DEFINE_int32(id, -1, "The node id in the cluster");
+DEFINE_bool(craft, false, "Run as CRaft instead of FlexRaft"); 
 
 int main(int argc, char *argv[]) {
   gflags::ParseCommandLineFlags(&argc, &argv, true);
@@ -24,6 +25,10 @@ int main(int argc, char *argv[]) {
   }
   auto cluster_cfg = ParseConfigurationFile(FLAGS_conf);
   auto node_id = FLAGS_id;
+
+  for (auto &[id, cfg] : cluster_cfg) {
+    cfg.use_craft = FLAGS_craft;
+}
 
   // Run the server
   auto node = kv::KvServiceNode::NewKvServiceNode(cluster_cfg, node_id);

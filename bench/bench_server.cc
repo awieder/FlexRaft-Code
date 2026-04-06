@@ -28,7 +28,7 @@ int main(int argc, char *argv[]) {
 
   for (auto &[id, cfg] : cluster_cfg) {
     cfg.use_craft = FLAGS_craft;
-}
+  }
 
   // Run the server
   auto node = kv::KvServiceNode::NewKvServiceNode(cluster_cfg, node_id);

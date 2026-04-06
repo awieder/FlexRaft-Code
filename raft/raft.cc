@@ -138,6 +138,7 @@ void RaftState::Process(RequestVoteArgs *args, RequestVoteReply *reply) {
 
 void RaftState::Process(AppendEntriesArgs *args, AppendEntriesReply *reply) {
   assert(args != nullptr && reply != nullptr);
+  args->entry_cnt = args->entries.size();
   live_monitor_.UpdateLiveness(args->leader_id);
 
   std::scoped_lock<std::mutex> lck(mtx_);
@@ -181,7 +182,7 @@ void RaftState::Process(AppendEntriesArgs *args, AppendEntriesReply *reply) {
   }
 
   // Step3: Check conflicts and add new entries
-  assert(args->entry_cnt == args->entries.size());
+  // assert(args->entry_cnt == args->entries.size());
   if (args->entry_cnt > 0) {
     checkConflictEntryAndAppendNew(args, reply);
   }
@@ -589,7 +590,21 @@ void RaftState::tryUpdateCommitIndex() {
     LOG(util::kRaft, "S%d I%d COMMIT REQUIRE %d, GET %d", id_, N,
         commit_require_k + livenessLevel(), agree_cnt);
     // ---------------------------------------------------------------------------------
-
+    if(use_craft_){
+      if (craft_mode_ == kNormalMode) {
+        // need all N nodes
+        if (agree_cnt >= GetClusterServerNumber() &&
+            lm_->GetSingleLogEntry(N)->Term() == CurrentTerm()) {
+            SetCommitIndex(N);
+        }
+    } else {
+        // degraded: need F+1
+        if (agree_cnt >= livenessLevel() + 1 &&
+            lm_->GetSingleLogEntry(N)->Term() == CurrentTerm()) {
+            SetCommitIndex(N);
+        }
+    }
+    } else {
     if (agree_cnt >= commit_require_k + livenessLevel() &&
         lm_->GetSingleLogEntry(N)->Term() == CurrentTerm()) {
       SetCommitIndex(N);
@@ -606,6 +621,7 @@ void RaftState::tryUpdateCommitIndex() {
         commit_elapse_time_[N] = dura.count();
       }
     }
+  }
   }
 }
 
@@ -1000,6 +1016,34 @@ void RaftState::ReplicateNewProposeEntry(raft_index_t raft_index) {
   // parameters as encoding parameter
   auto live_servers = live_monitor_.LiveNumber();
 
+  if (use_craft_) {
+    raft_encoding_param_t encode_k;
+    raft_encoding_param_t encode_m;
+    if (live_servers >= GetClusterServerNumber()){
+       SwitchToNormalMode();
+       encode_k = livenessLevel() + 1;
+       encode_m = GetClusterServerNumber() - encode_k;
+    } else {
+      SwitchToDegradedMode();
+      encode_k = 1;
+      encode_m = GetClusterServerNumber() - encode_k;
+    }
+    auto stripe = new Stripe();
+    EncodeRaftEntry(raft_index, encode_k, encode_m, stripe);
+    encoded_stripe_.insert_or_assign(raft_index, stripe);
+    UpdateLastEncodingK(raft_index, encode_k);
+
+    for (auto peer_id : peers_) {
+        if (peer_id != id_) {
+            sendAppendEntries(peer_id);
+        }
+    }
+    resetReplicateTimer();
+    return;
+
+
+  }
+
   // k = N'- F, m = N - k where N is fixed
   // Makes sure there are totally N chunks and each of these chunks is mapped to
   // a certain follower
@@ -1058,6 +1102,24 @@ void RaftState::ReplicateEntries() {
   auto live_servers = live_monitor_.LiveNumber();
   LOG(util::kRaft, "S%d Estimate Now Live Servers=%d, Last Point=%d", id_, live_servers,
       AliveServersOfLastPoint());
+
+  if (use_craft_) {
+        if (live_servers < GetClusterServerNumber()) {
+            SwitchToDegradedMode();
+        } else {
+            SwitchToNormalMode();
+        }
+        for (auto peer_id : peers_) {
+            if (peer_id != id_) {
+                if (live_monitor_.IsAlive(peer_id)) {
+                    sendAppendEntries(peer_id);
+                } else {
+                    sendHeartBeat(peer_id);
+                }
+            }
+        }
+        return;
+    }
   if (live_servers != AliveServersOfLastPoint()) {
     UpdateAliveServers(live_servers);
     MaybeReEncodingAndReplicate();
@@ -1072,20 +1134,34 @@ void RaftState::ReplicateEntries() {
         }
       }
     }
-  }
+ }
 }
 
 void RaftState::MaybeReEncodingAndReplicate() {
   LOG(util::kRaft, "S%d MAY REENCODE ENTRIES", id_);
 
   auto live_servers = live_monitor_.LiveNumber();
-  raft_encoding_param_t encode_k = live_servers - livenessLevel();
+  raft_encoding_param_t encode_k;
+  raft_encoding_param_t encode_m;
+  if (use_craft_) {
+    if (live_servers >= GetClusterServerNumber()){
+       encode_k = livenessLevel() + 1;
+       encode_m = GetClusterServerNumber() - encode_k;
+    } else {
+      encode_k = 1;
+      encode_m = GetClusterServerNumber() - encode_k;
+
+    }
+  }
+  else{
+  encode_k = live_servers - livenessLevel();
   // Ensure encode_k is at least 1 to avoid encoder assertion failure
   if (encode_k < 1) {
     encode_k = 1;
   }
-  raft_encoding_param_t encode_m = GetClusterServerNumber() - encode_k;
+  encode_m = GetClusterServerNumber() - encode_k;
   LOG(util::kRaft, "S%d Estimate %d Server Alive K:%d M:%d", id_, live_servers, encode_k, encode_m);
+}
 
   // Step1: ReEncoding all necessary entries from CommitIndex() + 1 to
   // LastIndex()
@@ -1272,7 +1348,6 @@ void RaftState::sendAppendEntries(raft_node_id_t peer) {
   if (next_index <= CommitIndex()) {
     LOG(util::kRaft, "[CC] S%d Recover data for S%d(I%d->I%d)", id_, peer, next_index,
         lm_->LastLogEntryIndex());
-    // This is a recovery task, we need to record the recovery stats
     if (GetRecoveryCtx(peer) == nullptr) {
       AddNewRecoveryCtx(peer);
       GetRecoveryCtx(peer)->start_recovery_index_ = next_index;
@@ -1280,18 +1355,23 @@ void RaftState::sendAppendEntries(raft_node_id_t peer) {
     }
   }
 
-  for (auto raft_index = next_index; raft_index <= lm_->LastLogEntryIndex(); ++raft_index) {
-    // Check if encoded stripe exists for this index before accessing
+for (auto raft_index = next_index; raft_index <= lm_->LastLogEntryIndex(); ++raft_index) {
     if (encoded_stripe_.count(raft_index) == 0 || encoded_stripe_[raft_index] == nullptr) {
       LOG(util::kRaft, "S%d Missing encoded_stripe for I%d, skipping remaining entries", id_, raft_index);
       break;
     }
-    args.entries.push_back(encoded_stripe_[raft_index]->fragments[peer]);
-  }
+    auto& fragments = encoded_stripe_[raft_index]->fragments;
+    // in degraded mode k=1 so only fragment 0 exists, use it for all peers
+    auto frag_id = (use_craft_ && craft_mode_ == kDegradedMode) ? 0 : peer;
+    args.entries.push_back(fragments.at(frag_id));
+}
+
   LOG(util::kRaft, "S%d AE To S%d (I%d->I%d) at T%d", id_, peer, next_index,
       lm_->LastLogEntryIndex(), CurrentTerm());
 
-  assert(require_entry_cnt == args.entries.size());
+  if (!use_craft_) {
+    assert(require_entry_cnt == args.entries.size());
+  }
   args.entry_cnt = args.entries.size();
 
   rpc_clients_[peer]->sendMessage(args);

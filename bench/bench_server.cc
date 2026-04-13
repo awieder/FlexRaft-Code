@@ -14,7 +14,8 @@
 
 DEFINE_string(conf, "", "The position of cluster configuration file");
 DEFINE_int32(id, -1, "The node id in the cluster");
-DEFINE_bool(craft, false, "Run as CRaft instead of FlexRaft"); 
+DEFINE_bool(craft, false, "Run as CRaft"); 
+DEFINE_bool(hraft, false, "Run as H-Raft");
 
 int main(int argc, char *argv[]) {
   gflags::ParseCommandLineFlags(&argc, &argv, true);
@@ -28,6 +29,9 @@ int main(int argc, char *argv[]) {
 
   for (auto &[id, cfg] : cluster_cfg) {
     cfg.use_craft = FLAGS_craft;
+  }
+  for (auto &[id, cfg] : cluster_cfg) {
+    cfg.use_hraft = FLAGS_hraft;
   }
 
   // Run the server

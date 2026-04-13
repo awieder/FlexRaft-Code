@@ -12,6 +12,7 @@ struct KvServiceNodeConfig {
   std::string raft_log_filename;
   std::string kv_dbname;
   bool use_craft = false;
+  bool use_hraft = false;
 };
 
 using KvClusterConfig = std::unordered_map<raft::raft_node_id_t, KvServiceNodeConfig>;

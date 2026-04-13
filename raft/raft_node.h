@@ -29,6 +29,7 @@ class RaftNode {
     // TODO: Add state machine into this config
     Rsm *rsm;
     bool use_craft = false;
+    bool use_hraft = false;
   };
 
   // Constructor
@@ -95,5 +96,6 @@ class RaftNode {
   Rsm *rsm_;
   Storage *storage_;
   bool use_craft_ = false;
+  bool use_hraft_ = false;
 };
 }  // namespace raft

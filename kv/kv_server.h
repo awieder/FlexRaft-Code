@@ -113,6 +113,8 @@ class KvServer {
     }
     return kv_peers_[node_id];
   }
+  raft::RaftNode* getRaftNode() { return raft_; }
+
 
  private:
   raft::RaftNode *raft_;

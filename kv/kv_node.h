@@ -42,6 +42,9 @@ class KvServiceNode {
 
   bool IsLeader() const { return kv_server_->IsLeader(); }
 
+  raft::RaftNode* getRaftNode() { return kv_server_->getRaftNode(); }
+
+
  private:
   KvClusterConfig config_;
   raft::raft_node_id_t id_;

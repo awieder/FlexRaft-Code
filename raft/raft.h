@@ -34,7 +34,7 @@ enum RaftRole {
 namespace config {
 const int64_t kHeartbeatInterval = 100;         // 100ms
 const int64_t kCollectFragmentsInterval = 100;  // 100ms
-const int64_t kReplicateInterval = 1000;
+const int64_t kReplicateInterval = 150;
 const int64_t kElectionTimeoutMin = 500;  // 500ms
 constexpr int kLivenessTimeoutInterval = 200;
 const int64_t kElectionTimeoutMax = 1000;  // 800ms
@@ -58,6 +58,7 @@ struct RaftConfig {
 
   Rsm *rsm;
   bool use_craft = false; 
+  bool use_hraft = false;
 
 };
 
@@ -435,6 +436,8 @@ class RaftState {
   void SwitchToDegradedMode();
   void SwitchToNormalMode();
 
+  void sendHRaftExtraShards(raft_index_t raft_index);
+
  public:
   // For concurrency control. A raft state instance might be accessed via
   // multiple threads, e.g. RPC thread that receives request; The state machine
@@ -523,6 +526,11 @@ class RaftState {
 
   int alive_servers_of_last_point_;
 
+  bool use_craft_ = false;
+  CRaftMode craft_mode_ = kNormalMode;
+
+  bool use_hraft_ = false;
+
  private:
   int vote_me_cnt_;
   Rsm *rsm_;
@@ -531,7 +539,5 @@ class RaftState {
   util::TimePoint preleader_timepoint_;
   uint64_t preleader_recover_ent_cnt_ = 0;
 
-  bool use_craft_ = false;
-  CRaftMode craft_mode_ = kNormalMode;
 };
 }  // namespace raft

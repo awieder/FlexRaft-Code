@@ -106,6 +106,120 @@ class KvClusterTest : public ::testing::Test {
   int node_num_;
 };
 
+TEST_F(KvClusterTest, TestCRaftDegradedThenNormal) {
+  auto cluster_config = KvClusterConfig{
+      {0, {0, {"127.0.0.1", 50000}, {"127.0.0.1", 50005}, "", "./testdb0", true}},
+      {1, {1, {"127.0.0.1", 50001}, {"127.0.0.1", 50006}, "", "./testdb1", true}},
+      {2, {2, {"127.0.0.1", 50002}, {"127.0.0.1", 50007}, "", "./testdb2", true}},
+      {3, {3, {"127.0.0.1", 50003}, {"127.0.0.1", 50008}, "", "./testdb3", true}},
+      {4, {4, {"127.0.0.1", 50004}, {"127.0.0.1", 50009}, "", "./testdb4", true}},
+  };
+
+  // Start only S0, S1, S2 — S3 and S4 are offline
+  for (int i = 0; i <= 2; ++i) {
+    auto node = KvServiceNode::NewKvServiceNode(cluster_config, i);
+    node->InitServiceNodeState();
+    nodes_[i] = node;
+  }
+  node_num_ = 5;  // cluster size is 5 even though only 3 are up
+
+  // Start S3 and S4 as disconnected placeholders so the client config is valid
+  for (int i = 3; i <= 4; ++i) {
+    auto node = KvServiceNode::NewKvServiceNode(cluster_config, i);
+    node->InitServiceNodeState();
+    nodes_[i] = node;
+  }
+
+  for (int i = 0; i <= 4; ++i) nodes_[i]->StartServiceNode();
+  Disconnect(3);
+  Disconnect(4);
+
+  sleepMs(2000);  // wait for election
+
+  auto client = std::make_shared<KvServiceClient>(cluster_config, 0);
+
+  // Phase 1: degraded — S3/S4 offline, should commit via F+1=3 quorum
+  printf("[Test] Phase 1: degraded (3 nodes)\n");
+  CheckBatchPut(client, "key", "val-", 1, 5);
+  printf("[Test] Phase 1 puts committed OK\n");
+
+  // Phase 2: bring S3 and S4 back — should switch to normal mode
+  printf("[Test] Phase 2: reconnect S3 and S4\n");
+  Reconnect(3);
+  Reconnect(4);
+  sleepMs(1000);  // let liveness monitor detect them
+
+  CheckBatchPut(client, "key", "val-", 6, 10);
+  printf("[Test] Phase 2 puts committed OK\n");
+
+  // Verify all keys readable
+  CheckBatchGet(client, "key", "val-", 1, 10);
+  printf("[Test] All gets OK\n");
+
+  ClearTestContext(cluster_config);
+}
+
+
+TEST_F(KvClusterTest, TestCRaftEncodingIsCorrect) {
+  auto cluster_config = KvClusterConfig{
+      {0, {0, {"127.0.0.1", 50000}, {"127.0.0.1", 50005}, "", "./testdb0", true}},
+      {1, {1, {"127.0.0.1", 50001}, {"127.0.0.1", 50006}, "", "./testdb1", true}},
+      {2, {2, {"127.0.0.1", 50002}, {"127.0.0.1", 50007}, "", "./testdb2", true}},
+      {3, {3, {"127.0.0.1", 50003}, {"127.0.0.1", 50008}, "", "./testdb3", true}},
+      {4, {4, {"127.0.0.1", 50004}, {"127.0.0.1", 50009}, "", "./testdb4", true}},
+  };
+
+  for (int i = 0; i < 5; ++i) {
+    auto node = KvServiceNode::NewKvServiceNode(cluster_config, i);
+    node->InitServiceNodeState();
+    nodes_[i] = node;
+  }
+  node_num_ = 5;
+  for (int i = 0; i < 5; ++i) nodes_[i]->StartServiceNode();
+
+  Disconnect(3);
+  Disconnect(4);
+  sleepMs(2000);
+
+  auto client = std::make_shared<KvServiceClient>(cluster_config, 0);
+  CheckBatchPut(client, "key", "val-", 1, 3);
+
+  // Find leader and get its RaftState directly
+  auto leader_id = GetLeaderId();
+  ASSERT_NE(leader_id, (raft::raft_node_id_t)-1);
+  auto* raft = nodes_[leader_id]->getRaftNode()->getRaftState();
+
+  // Verify use_craft is actually set
+  EXPECT_TRUE(raft->use_craft_);
+
+  // Verify encoding K during degraded: should be F+1=3, NOT 1
+  int F = raft->livenessLevel();
+  for (int idx = 1; idx <= 3; ++idx) {
+    auto k = raft->GetLastEncodingK(idx);
+    printf("[Test] I%d encoding K=%d (expect %d)\n", idx, k, F + 1);
+    EXPECT_EQ(k, 1) << "Expected CRaft K=1 but got K=" << k
+                         << " (looks like FlexRaft path was taken)";
+  }
+
+  // Verify craft_mode is degraded
+  EXPECT_EQ(raft->craft_mode_, raft::kDegradedMode);
+
+  // Phase 2: bring nodes back, verify switches to normal
+  Reconnect(3);
+  Reconnect(4);
+  sleepMs(1000);
+  CheckBatchPut(client, "key", "val-", 4, 6);
+
+  EXPECT_EQ(raft->craft_mode_, raft::kNormalMode);
+  for (int idx = 4; idx <= 6; ++idx) {
+    auto k = raft->GetLastEncodingK(idx);
+    printf("[Test] I%d encoding K=%d (expect %d)\n", idx, k, F + 1);
+    EXPECT_EQ(k, F + 1);
+  }
+
+  ClearTestContext(cluster_config);
+}
+
 TEST_F(KvClusterTest, DISABLED_TestSimplePutGetOperation) {
   auto cluster_config = KvClusterConfig{
       {0, {0, {"127.0.0.1", 50000}, {"127.0.0.1", 50003}, "", "./testdb0"}},

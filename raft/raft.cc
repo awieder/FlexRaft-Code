@@ -27,6 +27,8 @@ RaftState *RaftState::NewRaftState(const RaftConfig &config) {
   ret->id_ = config.id;
   ret->use_craft_ = config.use_craft;
   ret->craft_mode_ = kNormalMode;
+  ret->use_hraft_ = config.use_hraft;
+  printf("S%d use_hraft=%d\n", ret->id_, ret->use_hraft_);
 
   Storage::PersistRaftState state;
   // If the storage provides a valid persisted raft state, use this
@@ -450,7 +452,13 @@ ProposeResult RaftState::Propose(const CommandData &command) {
 
   if (storage_ != nullptr) {
     LOG(util::kRaft, "S%d Starts Persisting Propose Entry(I%d)", id_, entry.Index());
-    storage_->AppendEntry(entry);
+    if (use_craft_ && encoded_stripe_.count(next_entry_index)) {
+        // Store leader's own fragment, not the full entry
+        storage_->AppendEntry(encoded_stripe_[next_entry_index]->fragments[id_]);
+    }
+    else{
+        storage_->AppendEntry(entry);
+    }
     storage_->Sync();
     LOG(util::kRaft, "S%d Persist Propose Entry(I%d) Done", id_, entry.Index());
   }
@@ -519,6 +527,13 @@ void RaftState::checkConflictEntryAndAppendNew(AppendEntriesArgs *args, AppendEn
       // A previous entry might have been truncated, append it
       if (do_overwrite && storage_) {
         storage_->AppendEntry(*lm_->GetSingleLogEntry(raft_index));
+      }
+      // ── H-Raft: store extra shard separately ──────────────────────────
+      if (use_hraft_ && storage_) {
+        auto existing = lm_->GetSingleLogEntry(raft_index);
+        // Detect extra shard: same index, same term, same K, but this is
+        storage_->AppendExtraShard(raft_index, args->entries[array_index]);
+        LOG(util::kRaft, "S%d HRaft stored extra shard I%d", id_, raft_index);
       }
     }
 
@@ -590,7 +605,39 @@ void RaftState::tryUpdateCommitIndex() {
     LOG(util::kRaft, "S%d I%d COMMIT REQUIRE %d, GET %d", id_, N,
         commit_require_k + livenessLevel(), agree_cnt);
     // ---------------------------------------------------------------------------------
-    if(use_craft_){
+      if (use_hraft_) {
+      if (encoded_stripe_.count(N) == 0) return;
+      auto commit_k = GetLastEncodingK(N);
+      int hraft_agree = 1;  // leader
+      int dead = 0;
+      for (auto id : peers_) {
+        if (!live_monitor_.IsAlive(id)) { dead++; continue; }
+        auto node = raft_peer_[id];
+        if (node->matchChunkInfo.count(N) &&
+            node->matchChunkInfo[N].GetK() == commit_k) {
+          hraft_agree++;
+        }
+      }
+      int need = GetClusterServerNumber() - dead; //live nodes
+      LOG(util::kRaft, "S%d HRaft I%d need=%d have=%d dead=%d",
+          id_, N, need, hraft_agree, dead);
+      
+      if(hraft_agree < need) {
+        LOG(util::kRaft, "S%d HRaft I%d Not Committed: need=%d have=%d dead=%d",
+            id_, N, need, hraft_agree, dead);
+            break;
+      }
+
+        SetCommitIndex(N);
+        if (commit_start_time_.count(N)) {
+          auto end  = std::chrono::high_resolution_clock::now();
+          auto dura = std::chrono::duration_cast<std::chrono::microseconds>(
+              end - commit_start_time_[N]);
+          commit_elapse_time_[N] = dura.count();
+       } 
+      continue;
+    }
+    else if(use_craft_){
       if (craft_mode_ == kNormalMode) {
         // need all N nodes
         if (agree_cnt >= GetClusterServerNumber() &&
@@ -660,6 +707,12 @@ void RaftState::tryApplyLogEntries() {
     }
     last_applied_ += 1;
     LOG(util::kRaft, "S%d APPLY(%d->%d)", id_, old_apply_idx, last_applied_);
+
+    if (last_applied_ % 10 == 0) {
+    FILE* f = fopen("./experiments/commit_index.log", "a");
+    fprintf(f, "%lu,%d\n", util::NowTime(), last_applied_);
+    fclose(f);
+  }
   }
 }
 
@@ -774,6 +827,57 @@ void RaftState::broadcastHeartbeat() {
   }
   // replicateEntries();
 }
+
+//FOR HRAFT
+void RaftState::sendHRaftExtraShards(raft_index_t raft_index) {
+  if (encoded_stripe_.count(raft_index) == 0) return;
+  auto* stripe = encoded_stripe_[raft_index];
+ 
+  int F = livenessLevel();
+ 
+  for (auto dead_id : peers_) {
+    if (dead_id == id_) continue;
+    if (live_monitor_.IsAlive(dead_id)) continue;  // only act on offline peers
+ 
+    // Collect the first F live peers (peers_ is a std::set, so ascending order
+    // is deterministic — no coordination with other nodes needed).
+    int sent = 0;
+    for (auto live_id : peers_) {
+      if (sent >= F) break;
+      if (live_id == id_) continue;
+      if (!live_monitor_.IsAlive(live_id)) continue;
+ 
+      auto next_index = raft_peer_[live_id]->NextIndex();
+      // Only send the extra shard for raft_index once the peer has already
+      // accepted the entries up to raft_index - 1, otherwise the prev_log
+      // consistency check on the follower will reject it.
+      if (next_index > raft_index) {
+        // Peer already has this index (possibly with its own frag).
+        // Send again with dead_id's frag so it can update matchChunkInfo.
+        // prev is raft_index - 1 which the peer definitely has.
+        auto prev_index = raft_index - 1;
+        auto prev_term  = lm_->TermAt(prev_index);
+        auto prev_k     = GetLastEncodingK(prev_index);
+ 
+        AppendEntriesArgs args{CurrentTerm(), id_,
+                               prev_index, prev_term, prev_k,
+                               CommitIndex()};
+        args.entries.push_back(stripe->fragments[dead_id]);
+        args.entry_cnt = 1;
+ 
+        LOG(util::kRaft, "S%d HRaft extra shard: frag%d -> S%d I%d",
+            id_, dead_id, live_id, raft_index);
+        rpc_clients_[live_id]->sendMessage(args);
+        sent++;
+      }
+      // If next_index <= raft_index the peer hasn't caught up yet;
+      // sendAppendEntries will deliver raft_index with the peer's own frag
+      // in the normal replication path.  We skip for now and the replicate
+      // timer will call us again once it catches up.
+    }
+  }
+}
+ 
 
 void RaftState::collectFragments() {
   // Initiate a fragments collection task
@@ -1015,6 +1119,32 @@ void RaftState::ReplicateNewProposeEntry(raft_index_t raft_index) {
   // The leader estimates the number of current alive servers and uses the
   // parameters as encoding parameter
   auto live_servers = live_monitor_.LiveNumber();
+    if (use_hraft_) {
+    // H-Raft always encodes with K=F+1, M=F — never re-encodes.
+    auto F = livenessLevel();
+    raft_encoding_param_t encode_k = F + 1;
+    raft_encoding_param_t encode_m = F;
+    if (encoded_stripe_.count(raft_index) == 0 ||
+        GetLastEncodingK(raft_index) != encode_k) {
+      auto stripe = new Stripe();
+      EncodeRaftEntry(raft_index, encode_k, encode_m, stripe);
+      encoded_stripe_.insert_or_assign(raft_index, stripe);
+      UpdateLastEncodingK(raft_index, encode_k);
+    }
+    // Send each live peer its own shard (fragments[peer_id]) via the
+    // existing sendAppendEntries path, then send orphaned shards.
+    for (auto peer_id : peers_) {
+      if (peer_id == id_) continue;
+      if (live_monitor_.IsAlive(peer_id)) {
+        sendAppendEntries(peer_id);
+      } else {
+        sendHeartBeat(peer_id);
+      }
+    }
+    sendHRaftExtraShards(raft_index);
+    resetReplicateTimer();
+    return;
+  }
 
   if (use_craft_) {
     raft_encoding_param_t encode_k;
@@ -1102,6 +1232,23 @@ void RaftState::ReplicateEntries() {
   auto live_servers = live_monitor_.LiveNumber();
   LOG(util::kRaft, "S%d Estimate Now Live Servers=%d, Last Point=%d", id_, live_servers,
       AliveServersOfLastPoint());
+
+    if (use_hraft_) {
+    auto last = lm_->LastLogEntryIndex();
+    for (auto peer_id : peers_) {
+      if (peer_id == id_) continue;
+      if (live_monitor_.IsAlive(peer_id)) {
+        sendAppendEntries(peer_id);
+      } else {
+        sendHeartBeat(peer_id);
+      }
+    }
+    // Retry extra-shard delivery for every uncommitted index.
+    for (auto idx = CommitIndex() + 1; idx <= last; ++idx) {
+      sendHRaftExtraShards(idx);
+    }
+    return;
+  }
 
   if (use_craft_) {
         if (live_servers < GetClusterServerNumber()) {

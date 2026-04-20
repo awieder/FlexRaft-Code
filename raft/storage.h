@@ -56,6 +56,8 @@ class Storage {
   virtual void Sync() = 0;
 
   virtual ~Storage() = default;
+  virtual void AppendExtraShard(raft_index_t raft_index, const LogEntry &ent) {}
+
 };
 
 // This class is only for unit test, it is used for simulating the behaviour
@@ -119,6 +121,7 @@ class FileStorage : public Storage {
   ~FileStorage() {
     delete[] buf_;
     ::close(fd_);
+    if (extra_fd_ >= 0) ::close(extra_fd_);
   }
 
   raft_index_t LastIndex() const override { return header_.lastLogIndex; };
@@ -200,8 +203,16 @@ class FileStorage : public Storage {
   }
 
   void ConstructExtents();
+  //For H-Raft extra shard info storage
+  void AppendExtraShard(raft_index_t raft_index, const LogEntry &ent);
+  static constexpr const char* kExtraShardSuffix = ".extra";
 
  private:
+  //For H-Raft extra shard info storage
+  int extra_fd_ = -1;
+  size_t extra_last_off_ = 0;
+
+
   Header header_;
   int fd_;
   char *buf_;  // Internal buffer

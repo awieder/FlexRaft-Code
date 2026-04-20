@@ -26,6 +26,11 @@ FileStorage *FileStorage::Open(const std::string &filename) {
   auto ret = new FileStorage();
   ret->AllocateNewInternalBuffer(FileStorage::kInitBufSize);
   ret->fd_ = fd;
+  //H-Raft open extra file
+  std::string extra_filename = filename + kExtraShardSuffix;
+  ret->extra_fd_ = ::open(extra_filename.c_str(), O_CREAT | O_RDWR | O_APPEND, 0644);
+  ret->extra_last_off_ = ::lseek(ret->extra_fd_, 0, SEEK_END);
+
   if (auto size = ::read(fd, &(ret->header_), kHeaderSize) < kHeaderSize) {
     // No complete header
     ret->InitializeHeaderOnCreation();
@@ -115,6 +120,22 @@ void FileStorage::AppendEntry(const LogEntry &ent) {
   UpdateExtents(ent.Index(), extent);
 }
 
+//For H-Raft write extra shard to new file
+void FileStorage::AppendExtraShard(raft_index_t raft_index, const LogEntry &ent) {
+  auto ser = Serializer::NewSerializer();
+  auto write_size = ser.getSerializeSize(ent);
+  LOG(util::kRaft, "Storage: AppendExtraShard I%d, Size=%d", raft_index, write_size);
+  if (!this->buf_ || write_size > this->buf_size_) {
+    AllocateNewInternalBuffer(write_size);
+  }
+  ser.serialize_logentry_helper(&ent, this->buf_);
+  lseek(extra_fd_, extra_last_off_, SEEK_SET);
+  ::write(extra_fd_, buf_, write_size);
+  extra_last_off_ += write_size;
+  ::fsync(extra_fd_);
+  LOG(util::kRaft, "Storage: AppendExtraShard I%d, Size=%d", raft_index, write_size);
+}
+
 void FileStorage::DeleteEntriesFrom(raft_index_t raft_index) {
   LOG(util::kRaft, "Storage: Delete Entries From I%d", raft_index);
   if (raft_index > header_.lastLogIndex || extents_.count(raft_index) == 0) {
@@ -156,5 +177,6 @@ void FileStorage::ConstructExtents() {
     read_off += der.getSerializeSize(ent);
   }
 }
+
 
 }  // namespace raft

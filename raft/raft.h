@@ -5,6 +5,7 @@
 #include <mutex>
 #include <set>
 #include <unordered_map>
+#include <unordered_set>
 
 #include "encoder.h"
 #include "log_entry.h"
@@ -530,6 +531,16 @@ class RaftState {
   CRaftMode craft_mode_ = kNormalMode;
 
   bool use_hraft_ = false;
+  // hraft_extra_acked_[raft_index][dead_peer_id] = set of live peer_ids that acked the extra shard
+  std::unordered_map<raft_index_t,
+  std::unordered_map<raft_node_id_t, std::unordered_set<raft_node_id_t>>>
+    hraft_extra_acked_;
+
+std::unordered_map<raft_index_t, 
+  std::unordered_map<raft_node_id_t, std::unordered_set<raft_node_id_t>>> 
+    hraft_extra_sent_;
+// hraft_extra_sent_[raft_index][dead_id] = set of live peers that received dead_id's shard
+
 
  private:
   int vote_me_cnt_;
